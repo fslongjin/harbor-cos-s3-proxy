@@ -61,6 +61,24 @@ func TestTargetURLForMultipartUpload(t *testing.T) {
 	}
 }
 
+func TestTargetURLPreservesEscapedObjectPath(t *testing.T) {
+	p := proxyServer{
+		cfg: config{
+			Bucket:   "example-bucket-1234567890",
+			Endpoint: "https://example-bucket-1234567890.cos.example-region.myqcloud.com",
+		},
+	}
+	req := &http.Request{URL: mustURL(t, "http://127.0.0.1:19000/example-bucket-1234567890/root/a%2Fb/data")}
+	got, err := p.targetURL(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "https://example-bucket-1234567890.cos.example-region.myqcloud.com/root/a%2Fb/data"
+	if got.String() != want {
+		t.Fatalf("got %q, want %q", got.String(), want)
+	}
+}
+
 func TestSignRequestUsesVirtualHost(t *testing.T) {
 	u, err := url.Parse("https://example-bucket-1234567890.cos.example-region.myqcloud.com/docker/registry/v2/blobs/data")
 	if err != nil {
@@ -180,6 +198,27 @@ func TestHandleCompleteMultipartUploadTracksUploadDataKey(t *testing.T) {
 	}
 }
 
+func TestHandleCompleteMultipartUploadDoesNotTrackEmbeddedError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<Error><Code>InternalError</Code></Error>`))
+	}))
+	defer upstream.Close()
+
+	p := testProxy(upstream)
+	req := httptest.NewRequest(http.MethodPost, "http://proxy/example-bucket-1234567890/root/docker/registry/v2/repositories/repo/_uploads/upload-id/data?uploadId=upload-id", strings.NewReader(`<CompleteMultipartUpload/>`))
+	rec := httptest.NewRecorder()
+	p.handle(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	key := "root/docker/registry/v2/repositories/repo/_uploads/upload-id/data"
+	if p.uploadDataKeys.has(key, time.Now()) {
+		t.Fatalf("upload data key was tracked for embedded error: %s", key)
+	}
+}
+
 func TestHandleRetriesEmptyCompletedUploadDataList(t *testing.T) {
 	key := "root/docker/registry/v2/repositories/repo/_uploads/upload-id/data"
 	calls := 0
@@ -220,6 +259,38 @@ func TestHandleRetriesEmptyCompletedUploadDataList(t *testing.T) {
 	}
 }
 
+func TestHandleKeepsOriginalEmptyListWhenRetryFails(t *testing.T) {
+	key := "root/docker/registry/v2/repositories/repo/_uploads/upload-id/data"
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/xml")
+		if calls == 1 {
+			_, _ = w.Write([]byte(`<ListBucketResult><Name>example-bucket-1234567890</Name><IsTruncated>false</IsTruncated></ListBucketResult>`))
+			return
+		}
+		http.Error(w, "slow down", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	p := testProxy(upstream)
+	p.cfg.ListRetry.Attempts = 1
+	p.uploadDataKeys.mark(key, time.Now())
+	req := httptest.NewRequest(http.MethodGet, "http://proxy/example-bucket-1234567890?max-keys=1&prefix="+url.QueryEscape(key), http.NoBody)
+	rec := httptest.NewRecorder()
+	p.handle(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+	if strings.Contains(rec.Body.String(), "slow down") {
+		t.Fatalf("retry error body leaked to caller: %s", rec.Body.String())
+	}
+}
+
 func TestHandleNormalizesTrackedUploadDataListTruncation(t *testing.T) {
 	key := "root/docker/registry/v2/repositories/repo/_uploads/upload-id/data"
 	calls := 0
@@ -247,27 +318,53 @@ func TestHandleNormalizesTrackedUploadDataListTruncation(t *testing.T) {
 	}
 }
 
-func TestHandleDoesNotRetryUploadDataListPagination(t *testing.T) {
+func TestHandleDoesNotNormalizeMultiObjectUploadDataList(t *testing.T) {
 	key := "root/docker/registry/v2/repositories/repo/_uploads/upload-id/data"
-	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
 		w.Header().Set("Content-Type", "application/xml")
-		_, _ = w.Write([]byte(`<ListBucketResult><Name>example-bucket-1234567890</Name><IsTruncated>false</IsTruncated></ListBucketResult>`))
+		_, _ = w.Write([]byte(`<ListBucketResult><Name>example-bucket-1234567890</Name><Contents><Key>` + key + `</Key></Contents><Contents><Key>` + key + `.extra</Key></Contents><IsTruncated>true</IsTruncated></ListBucketResult>`))
 	}))
 	defer upstream.Close()
 
 	p := testProxy(upstream)
 	p.uploadDataKeys.mark(key, time.Now())
-	req := httptest.NewRequest(http.MethodGet, "http://proxy/example-bucket-1234567890?marker="+url.QueryEscape(key)+"&prefix="+url.QueryEscape(key), http.NoBody)
+	req := httptest.NewRequest(http.MethodGet, "http://proxy/example-bucket-1234567890?max-keys=1&prefix="+url.QueryEscape(key), http.NoBody)
 	rec := httptest.NewRecorder()
 	p.handle(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	if calls != 1 {
-		t.Fatalf("upstream calls = %d, want 1", calls)
+	if !strings.Contains(rec.Body.String(), "<IsTruncated>true</IsTruncated>") {
+		t.Fatalf("multi-object response was normalized: %s", rec.Body.String())
+	}
+}
+
+func TestHandleDoesNotRetryUploadDataListPagination(t *testing.T) {
+	key := "root/docker/registry/v2/repositories/repo/_uploads/upload-id/data"
+	for _, cursor := range []string{"marker", "continuation-token", "start-after"} {
+		t.Run(cursor, func(t *testing.T) {
+			calls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = w.Write([]byte(`<ListBucketResult><Name>example-bucket-1234567890</Name><IsTruncated>false</IsTruncated></ListBucketResult>`))
+			}))
+			defer upstream.Close()
+
+			p := testProxy(upstream)
+			p.uploadDataKeys.mark(key, time.Now())
+			req := httptest.NewRequest(http.MethodGet, "http://proxy/example-bucket-1234567890?"+cursor+"="+url.QueryEscape(key)+"&prefix="+url.QueryEscape(key), http.NoBody)
+			rec := httptest.NewRecorder()
+			p.handle(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if calls != 1 {
+				t.Fatalf("upstream calls = %d, want 1", calls)
+			}
+		})
 	}
 }
 

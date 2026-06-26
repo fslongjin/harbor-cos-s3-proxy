@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -385,10 +386,19 @@ func (p *proxyServer) handle(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s -> %s response handling error after %s: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), time.Since(start), err)
 		return
 	}
+	if replayBody == nil && isCompleteMultipartUploadRequest(r.Method, targetURL) {
+		replayBody, err = io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			log.Printf("%s %s -> %s complete multipart response read error after %s: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), time.Since(start), err)
+			return
+		}
+		_ = resp.Body.Close()
+	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusBadRequest {
-		p.observeSuccessfulRequest(r, targetURL)
+		p.observeSuccessfulRequest(r, targetURL, replayBody)
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -423,8 +433,8 @@ func (p *proxyServer) handle(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%s %s -> %s %d %s", r.Method, r.URL.RequestURI(), targetURL.Redacted(), resp.StatusCode, time.Since(start))
 }
 
-func (p *proxyServer) observeSuccessfulRequest(r *http.Request, targetURL *url.URL) {
-	if isCompleteMultipartUploadRequest(r.Method, targetURL) {
+func (p *proxyServer) observeSuccessfulRequest(r *http.Request, targetURL *url.URL, responseBody []byte) {
+	if isCompleteMultipartUploadRequest(r.Method, targetURL) && isSuccessfulCompleteMultipartResponse(responseBody) {
 		key := objectKeyFromTargetURL(targetURL)
 		p.uploadDataKeys.mark(key, time.Now())
 		log.Printf("tracking completed upload data object for list retry: %s", key)
@@ -445,7 +455,7 @@ func (p *proxyServer) retryEmptyCompletedUploadList(ctx context.Context, origina
 	if resp.StatusCode != http.StatusOK || !p.uploadDataKeys.has(prefix, time.Now()) {
 		return body, nil
 	}
-	if hasExactListKey(body, prefix) {
+	if isExactSingleObjectList(body, prefix) {
 		normalized := normalizeSingleObjectList(body)
 		if string(normalized) != string(body) {
 			log.Printf("%s %s -> %s normalized tracked upload list truncation after %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), time.Since(start))
@@ -465,27 +475,22 @@ func (p *proxyServer) retryEmptyCompletedUploadList(ctx context.Context, origina
 		maxDelay = delay
 	}
 
-	currentBody := body
-	currentResp := resp
 	for attempt := 1; attempt <= p.cfg.ListRetry.Attempts; attempt++ {
 		if err := sleepWithContext(ctx, delay); err != nil {
-			return currentBody, nil
+			return body, nil
 		}
 
 		retryResp, retryBody, err := p.doSignedEmptyRequest(ctx, original, targetURL)
 		if err != nil {
 			log.Printf("%s %s -> %s empty upload list retry %d/%d failed after %s: %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), attempt, p.cfg.ListRetry.Attempts, time.Since(start), describeNetworkError(err))
-		} else {
-			currentResp = retryResp
-			currentBody = retryBody
-			if retryResp.StatusCode != http.StatusOK || hasListContents(retryBody) {
-				if retryResp.StatusCode == http.StatusOK && hasExactListKey(retryBody, prefix) {
-					currentBody = normalizeSingleObjectList(retryBody)
-				}
-				*resp = *currentResp
+		} else if retryResp.StatusCode == http.StatusOK {
+			if isExactSingleObjectList(retryBody, prefix) {
+				*resp = *retryResp
 				log.Printf("%s %s -> %s empty upload list became visible on retry %d/%d after %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), attempt, p.cfg.ListRetry.Attempts, time.Since(start))
-				return currentBody, nil
+				return normalizeSingleObjectList(retryBody), nil
 			}
+		} else {
+			log.Printf("%s %s -> %s empty upload list retry %d/%d returned %d after %s; keeping original response", original.Method, original.URL.RequestURI(), targetURL.Redacted(), attempt, p.cfg.ListRetry.Attempts, retryResp.StatusCode, time.Since(start))
 		}
 
 		delay *= 2
@@ -494,9 +499,8 @@ func (p *proxyServer) retryEmptyCompletedUploadList(ctx context.Context, origina
 		}
 	}
 
-	*resp = *currentResp
 	log.Printf("%s %s -> %s empty upload list still empty after %d retries and %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), p.cfg.ListRetry.Attempts, time.Since(start))
-	return currentBody, nil
+	return body, nil
 }
 
 func (p *proxyServer) doSignedEmptyRequest(ctx context.Context, original *http.Request, targetURL *url.URL) (*http.Response, []byte, error) {
@@ -526,14 +530,19 @@ func isCompleteMultipartUploadRequest(method string, targetURL *url.URL) bool {
 	return method == http.MethodPost && targetURL.Query().Get("uploadId") != "" && isUploadDataKey(objectKeyFromTargetURL(targetURL))
 }
 
+func isSuccessfulCompleteMultipartResponse(body []byte) bool {
+	return bytesContainsXMLName(body, "CompleteMultipartUploadResult") && !bytesContainsXMLName(body, "Error")
+}
+
 func (p *proxyServer) retryableUploadDataList(method string, targetURL *url.URL) (string, bool) {
 	if method != http.MethodGet || targetURL.Path != "/" {
 		return "", false
 	}
-	if targetURL.Query().Get("marker") != "" {
+	query := targetURL.Query()
+	if query.Get("marker") != "" || query.Get("continuation-token") != "" || query.Get("start-after") != "" {
 		return "", false
 	}
-	prefix := targetURL.Query().Get("prefix")
+	prefix := query.Get("prefix")
 	if !isUploadDataKey(prefix) {
 		return "", false
 	}
@@ -556,11 +565,12 @@ type listBucketResult struct {
 	Contents []struct {
 		Key string `xml:"Key"`
 	} `xml:"Contents"`
+	CommonPrefixes []struct{} `xml:"CommonPrefixes"`
 }
 
 func hasExactListKey(body []byte, key string) bool {
-	var result listBucketResult
-	if err := xml.Unmarshal(body, &result); err != nil {
+	result, ok := parseListBucketResult(body)
+	if !ok {
 		return false
 	}
 	for _, content := range result.Contents {
@@ -571,10 +581,39 @@ func hasExactListKey(body []byte, key string) bool {
 	return false
 }
 
+func isExactSingleObjectList(body []byte, key string) bool {
+	result, ok := parseListBucketResult(body)
+	if !ok || len(result.Contents) != 1 || len(result.CommonPrefixes) != 0 {
+		return false
+	}
+	return result.Contents[0].Key == key
+}
+
+func parseListBucketResult(body []byte) (listBucketResult, bool) {
+	var result listBucketResult
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return listBucketResult{}, false
+	}
+	return result, true
+}
+
 var isTruncatedTruePattern = regexp.MustCompile(`(?is)<IsTruncated>\s*true\s*</IsTruncated>`)
 
 func normalizeSingleObjectList(body []byte) []byte {
 	return isTruncatedTruePattern.ReplaceAll(body, []byte("<IsTruncated>false</IsTruncated>"))
+}
+
+func bytesContainsXMLName(body []byte, name string) bool {
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		if start, ok := token.(xml.StartElement); ok && start.Name.Local == name {
+			return true
+		}
+	}
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {
@@ -594,14 +633,18 @@ func (p *proxyServer) targetURL(r *http.Request) (*url.URL, error) {
 		return nil, err
 	}
 
-	stripped, err := stripBucketPrefix(r.URL.Path, p.cfg.Bucket)
+	strippedEscaped, err := stripBucketPrefix(r.URL.EscapedPath(), p.cfg.Bucket)
+	if err != nil {
+		return nil, err
+	}
+	stripped, err := url.PathUnescape(strippedEscaped)
 	if err != nil {
 		return nil, err
 	}
 
 	u := *base
 	u.Path = stripped
-	u.RawPath = ""
+	u.RawPath = strippedEscaped
 	u.RawQuery = r.URL.RawQuery
 	return &u, nil
 }
