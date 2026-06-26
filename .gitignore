@@ -1,0 +1,5 @@
+/harbor-cos-s3-proxy
+/dist/
+/cos-s3-proxy.env
+*.log
+*.tmp

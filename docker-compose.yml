@@ -1,0 +1,30 @@
+services:
+  harbor-cos-s3-proxy:
+    build: .
+    image: harbor-cos-s3-proxy:latest
+    platform: linux/amd64
+    container_name: harbor-cos-s3-proxy
+    restart: unless-stopped
+    stop_grace_period: 45s
+    env_file:
+      - ./cos-s3-proxy.env
+    networks:
+      - harbor
+    volumes:
+      - ./data/proxy-spool:/spool
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:19000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  harbor:
+    external: true
+    name: ${HARBOR_NETWORK:-harbor_harbor}
