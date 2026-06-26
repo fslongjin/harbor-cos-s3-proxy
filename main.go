@@ -4,17 +4,22 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,18 +37,30 @@ type config struct {
 	Endpoint     string
 	SpoolDir     string
 	ShutdownWait time.Duration
+	ListRetry    listRetryConfig
+	CacheTTL     time.Duration
+}
+
+type listRetryConfig struct {
+	Attempts     int
+	InitialDelay time.Duration
+	MaxDelay     time.Duration
 }
 
 type proxyServer struct {
-	cfg    config
-	client *http.Client
-	signer *awsv4.Signer
+	cfg            config
+	client         *http.Client
+	signer         *awsv4.Signer
+	uploadDataKeys *objectCache
 }
 
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
 		log.Fatalf("config error: %v", err)
+	}
+	if err := ensureSpoolDirWritable(cfg.SpoolDir); err != nil {
+		log.Fatalf("spool dir is not writable: %v", err)
 	}
 	if removed, err := cleanupSpoolDir(cfg.SpoolDir); err != nil {
 		log.Printf("spool cleanup finished with errors, removed=%d: %v", removed, err)
@@ -55,6 +72,9 @@ func main() {
 		cfg: cfg,
 		client: &http.Client{
 			Timeout: 0,
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
 				MaxIdleConns:          200,
@@ -62,9 +82,11 @@ func main() {
 				IdleConnTimeout:       90 * time.Second,
 				TLSHandshakeTimeout:   15 * time.Second,
 				ExpectContinueTimeout: 5 * time.Second,
+				DisableCompression:    true,
 			},
 		},
-		signer: awsv4.NewSigner(),
+		signer:         awsv4.NewSigner(),
+		uploadDataKeys: newObjectCache(cfg.CacheTTL),
 	}
 
 	mux := http.NewServeMux()
@@ -113,6 +135,22 @@ func loadConfig() (config, error) {
 		return cfg, err
 	}
 	cfg.ShutdownWait = shutdownWait
+	cfg.CacheTTL, err = parseDurationEnv("UPLOAD_DATA_CACHE_TTL", 10*time.Minute)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ListRetry.Attempts, err = parseIntEnv("LIST_RETRY_ATTEMPTS", 5)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ListRetry.InitialDelay, err = parseDurationEnv("LIST_RETRY_INITIAL_DELAY", 100*time.Millisecond)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ListRetry.MaxDelay, err = parseDurationEnv("LIST_RETRY_MAX_DELAY", 2*time.Second)
+	if err != nil {
+		return cfg, err
+	}
 
 	cfg.Endpoint = os.Getenv("COS_ENDPOINT")
 	if cfg.Endpoint == "" {
@@ -141,11 +179,75 @@ func parseDurationEnv(key string, fallback time.Duration) (time.Duration, error)
 	return duration, nil
 }
 
+func parseIntEnv(key string, fallback int) (int, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", key)
+	}
+	return parsed, nil
+}
+
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
+}
+
+type objectCache struct {
+	mu   sync.Mutex
+	ttl  time.Duration
+	keys map[string]time.Time
+}
+
+func newObjectCache(ttl time.Duration) *objectCache {
+	return &objectCache{
+		ttl:  ttl,
+		keys: make(map[string]time.Time),
+	}
+}
+
+func (c *objectCache) mark(key string, now time.Time) {
+	if c == nil || key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.keys[key] = now.Add(c.ttl)
+	c.cleanupLocked(now)
+}
+
+func (c *objectCache) has(key string, now time.Time) bool {
+	if c == nil || key == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	expiresAt, ok := c.keys[key]
+	if !ok {
+		return false
+	}
+	if !now.Before(expiresAt) {
+		delete(c.keys, key)
+		return false
+	}
+	c.cleanupLocked(now)
+	return true
+}
+
+func (c *objectCache) cleanupLocked(now time.Time) {
+	for key, expiresAt := range c.keys {
+		if !now.Before(expiresAt) {
+			delete(c.keys, key)
+		}
+	}
 }
 
 func runServer(server *http.Server, shutdownWait time.Duration) error {
@@ -218,6 +320,25 @@ func cleanupSpoolDir(spoolDir string) (int, error) {
 	return removed, errors.Join(errs...)
 }
 
+func ensureSpoolDirWritable(spoolDir string) error {
+	if err := os.MkdirAll(spoolDir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(spoolDir, spoolTempPrefix+"write-check-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Remove(name); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (p *proxyServer) handle(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	targetURL, err := p.targetURL(r)
@@ -229,6 +350,7 @@ func (p *proxyServer) handle(w http.ResponseWriter, r *http.Request) {
 	body, cleanup, payloadHash, contentLength, err := p.prepareBody(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
+		log.Printf("%s %s body prepare error after %s: %v", r.Method, r.URL.RequestURI(), time.Since(start), err)
 		return
 	}
 	defer cleanup()
@@ -239,6 +361,7 @@ func (p *proxyServer) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	outReq.ContentLength = contentLength
+	outReq.Host = outReq.URL.Host
 	copyForwardHeaders(outReq.Header, r.Header)
 	if r.ContentLength == 0 {
 		outReq.ContentLength = 0
@@ -246,25 +369,223 @@ func (p *proxyServer) handle(w http.ResponseWriter, r *http.Request) {
 
 	if err := p.signRequest(r.Context(), outReq, payloadHash, time.Now().UTC()); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
+		log.Printf("%s %s -> %s sign error after %s: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), time.Since(start), err)
 		return
 	}
 
 	resp, err := p.client.Do(outReq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
-		log.Printf("%s %s -> %s error after %s: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), time.Since(start), err)
+		log.Printf("%s %s -> %s content_length=%d payload_hash=%s network error after %s: %s", r.Method, r.URL.RequestURI(), targetURL.Redacted(), outReq.ContentLength, payloadHash, time.Since(start), describeNetworkError(err))
+		return
+	}
+	replayBody, err := p.retryEmptyCompletedUploadList(r.Context(), r, targetURL, resp, start)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		log.Printf("%s %s -> %s response handling error after %s: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), time.Since(start), err)
 		return
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode < http.StatusBadRequest {
+		p.observeSuccessfulRequest(r, targetURL)
+	}
+
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("%s %s -> %s response copy error: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), err)
+	if resp.StatusCode >= http.StatusBadRequest {
+		body := replayBody
+		if body == nil {
+			body, err = io.ReadAll(resp.Body)
+			if err != nil {
+				log.Printf("%s %s -> %s %d response read error after %s: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), resp.StatusCode, time.Since(start), err)
+				return
+			}
+		}
+		if len(body) > 0 {
+			log.Printf("%s %s -> %s %d %s upstream error: %s", r.Method, r.URL.RequestURI(), targetURL.Redacted(), resp.StatusCode, time.Since(start), trimLogBody(body, 2048))
+		} else {
+			log.Printf("%s %s -> %s %d %s upstream error with empty body", r.Method, r.URL.RequestURI(), targetURL.Redacted(), resp.StatusCode, time.Since(start))
+		}
+		_, _ = w.Write(body)
 		return
 	}
 
+	if replayBody != nil {
+		_, _ = w.Write(replayBody)
+	} else {
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			log.Printf("%s %s -> %s response copy error: %v", r.Method, r.URL.RequestURI(), targetURL.Redacted(), err)
+			return
+		}
+	}
+
 	log.Printf("%s %s -> %s %d %s", r.Method, r.URL.RequestURI(), targetURL.Redacted(), resp.StatusCode, time.Since(start))
+}
+
+func (p *proxyServer) observeSuccessfulRequest(r *http.Request, targetURL *url.URL) {
+	if isCompleteMultipartUploadRequest(r.Method, targetURL) {
+		key := objectKeyFromTargetURL(targetURL)
+		p.uploadDataKeys.mark(key, time.Now())
+		log.Printf("tracking completed upload data object for list retry: %s", key)
+	}
+}
+
+func (p *proxyServer) retryEmptyCompletedUploadList(ctx context.Context, original *http.Request, targetURL *url.URL, resp *http.Response, start time.Time) ([]byte, error) {
+	prefix, ok := p.retryableUploadDataList(original.Method, targetURL)
+	if !ok {
+		return nil, nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !p.uploadDataKeys.has(prefix, time.Now()) {
+		return body, nil
+	}
+	if hasExactListKey(body, prefix) {
+		normalized := normalizeSingleObjectList(body)
+		if string(normalized) != string(body) {
+			log.Printf("%s %s -> %s normalized tracked upload list truncation after %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), time.Since(start))
+		}
+		return normalized, nil
+	}
+	if hasListContents(body) || p.cfg.ListRetry.Attempts == 0 {
+		return body, nil
+	}
+
+	delay := p.cfg.ListRetry.InitialDelay
+	if delay <= 0 {
+		delay = 100 * time.Millisecond
+	}
+	maxDelay := p.cfg.ListRetry.MaxDelay
+	if maxDelay <= 0 {
+		maxDelay = delay
+	}
+
+	currentBody := body
+	currentResp := resp
+	for attempt := 1; attempt <= p.cfg.ListRetry.Attempts; attempt++ {
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return currentBody, nil
+		}
+
+		retryResp, retryBody, err := p.doSignedEmptyRequest(ctx, original, targetURL)
+		if err != nil {
+			log.Printf("%s %s -> %s empty upload list retry %d/%d failed after %s: %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), attempt, p.cfg.ListRetry.Attempts, time.Since(start), describeNetworkError(err))
+		} else {
+			currentResp = retryResp
+			currentBody = retryBody
+			if retryResp.StatusCode != http.StatusOK || hasListContents(retryBody) {
+				if retryResp.StatusCode == http.StatusOK && hasExactListKey(retryBody, prefix) {
+					currentBody = normalizeSingleObjectList(retryBody)
+				}
+				*resp = *currentResp
+				log.Printf("%s %s -> %s empty upload list became visible on retry %d/%d after %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), attempt, p.cfg.ListRetry.Attempts, time.Since(start))
+				return currentBody, nil
+			}
+		}
+
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+
+	*resp = *currentResp
+	log.Printf("%s %s -> %s empty upload list still empty after %d retries and %s", original.Method, original.URL.RequestURI(), targetURL.Redacted(), p.cfg.ListRetry.Attempts, time.Since(start))
+	return currentBody, nil
+}
+
+func (p *proxyServer) doSignedEmptyRequest(ctx context.Context, original *http.Request, targetURL *url.URL) (*http.Response, []byte, error) {
+	outReq, err := http.NewRequestWithContext(ctx, original.Method, targetURL.String(), http.NoBody)
+	if err != nil {
+		return nil, nil, err
+	}
+	outReq.ContentLength = 0
+	outReq.Host = outReq.URL.Host
+	copyForwardHeaders(outReq.Header, original.Header)
+	if err := p.signRequest(ctx, outReq, emptyPayloadHash, time.Now().UTC()); err != nil {
+		return nil, nil, err
+	}
+	resp, err := p.client.Do(outReq)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp, body, nil
+}
+
+func isCompleteMultipartUploadRequest(method string, targetURL *url.URL) bool {
+	return method == http.MethodPost && targetURL.Query().Get("uploadId") != "" && isUploadDataKey(objectKeyFromTargetURL(targetURL))
+}
+
+func (p *proxyServer) retryableUploadDataList(method string, targetURL *url.URL) (string, bool) {
+	if method != http.MethodGet || targetURL.Path != "/" {
+		return "", false
+	}
+	if targetURL.Query().Get("marker") != "" {
+		return "", false
+	}
+	prefix := targetURL.Query().Get("prefix")
+	if !isUploadDataKey(prefix) {
+		return "", false
+	}
+	return prefix, true
+}
+
+func objectKeyFromTargetURL(targetURL *url.URL) string {
+	return strings.TrimPrefix(targetURL.Path, "/")
+}
+
+func isUploadDataKey(key string) bool {
+	return strings.Contains(key, "/_uploads/") && strings.HasSuffix(key, "/data")
+}
+
+func hasListContents(body []byte) bool {
+	return strings.Contains(string(body), "<Contents>") && strings.Contains(string(body), "<Key>")
+}
+
+type listBucketResult struct {
+	Contents []struct {
+		Key string `xml:"Key"`
+	} `xml:"Contents"`
+}
+
+func hasExactListKey(body []byte, key string) bool {
+	var result listBucketResult
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return false
+	}
+	for _, content := range result.Contents {
+		if content.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+var isTruncatedTruePattern = regexp.MustCompile(`(?is)<IsTruncated>\s*true\s*</IsTruncated>`)
+
+func normalizeSingleObjectList(body []byte) []byte {
+	return isTruncatedTruePattern.ReplaceAll(body, []byte("<IsTruncated>false</IsTruncated>"))
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (p *proxyServer) targetURL(r *http.Request) (*url.URL, error) {
@@ -347,9 +668,9 @@ func copyForwardHeaders(dst, src http.Header) {
 
 func shouldSkipRequestHeader(key string) bool {
 	switch strings.ToLower(key) {
-	case "authorization", "connection", "host", "proxy-authenticate", "proxy-authorization",
-		"te", "trailer", "transfer-encoding", "upgrade", "x-amz-content-sha256",
-		"x-amz-date", "x-amz-security-token":
+	case "authorization", "connection", "content-length", "host", "proxy-authenticate", "proxy-authorization",
+		"accept-encoding", "expect", "te", "trailer", "transfer-encoding", "upgrade", "x-amz-content-sha256",
+		"x-amz-date", "x-amz-security-token", "x-amz-storage-class", "x-cos-storage-class":
 		return true
 	default:
 		return false
@@ -369,11 +690,31 @@ func copyResponseHeaders(dst, src http.Header) {
 
 func shouldSkipResponseHeader(key string) bool {
 	switch strings.ToLower(key) {
-	case "connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+	case "connection", "content-length", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
 		return true
 	default:
 		return false
 	}
+}
+
+func trimLogBody(body []byte, limit int) string {
+	text := strings.TrimSpace(string(body))
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "...<truncated>"
+}
+
+func describeNetworkError(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		var netErr net.Error
+		if errors.As(urlErr.Err, &netErr) {
+			return fmt.Sprintf("%T: %v timeout=%t temporary=%t", urlErr.Err, urlErr.Err, netErr.Timeout(), netErr.Temporary())
+		}
+		return fmt.Sprintf("%T: %v", urlErr.Err, urlErr.Err)
+	}
+	return fmt.Sprintf("%T: %v", err, err)
 }
 
 const emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

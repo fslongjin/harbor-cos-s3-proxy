@@ -13,8 +13,8 @@ RUN sed -i 's@//.*archive.ubuntu.com@//mirrors.ustc.edu.cn@g' /etc/apt/sources.l
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system cosproxy \
-    && useradd --system --gid cosproxy --home-dir /nonexistent --shell /usr/sbin/nologin cosproxy \
+    && groupadd --system --gid 10001 cosproxy \
+    && useradd --system --uid 10001 --gid cosproxy --home-dir /nonexistent --shell /usr/sbin/nologin cosproxy \
     && mkdir -p /spool \
     && chown cosproxy:cosproxy /spool
 USER cosproxy

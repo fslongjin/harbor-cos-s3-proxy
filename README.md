@@ -49,11 +49,20 @@ Optional:
 export COS_ENDPOINT=https://your-cos-bucket-appid.cos.your-cos-region.myqcloud.com
 export COS_SESSION_TOKEN='temporary-token-if-used'
 export SPOOL_DIR=/var/lib/harbor-cos-s3-proxy/spool
+export LIST_RETRY_ATTEMPTS=5
+export LIST_RETRY_INITIAL_DELAY=100ms
+export LIST_RETRY_MAX_DELAY=2s
+export UPLOAD_DATA_CACHE_TTL=10m
 ```
 
 The proxy spools request bodies to disk before forwarding them, because S3 V4
 signing needs a payload hash. Put `SPOOL_DIR` on a filesystem with enough free
 space for Harbor upload parts.
+
+For Harbor push cleanup, Distribution may list a just-completed
+`_uploads/.../data` object before COS makes it visible through `ListObjects`.
+The `LIST_RETRY_*` settings only retry those tracked upload-data list requests;
+the proxy does not synthesize list results.
 
 ## Docker Compose
 
@@ -74,13 +83,16 @@ export HARBOR_NETWORK=harbor_harbor
 Start the proxy:
 
 ```bash
+mkdir -p ./data/proxy-spool
+chown -R 10001:10001 ./data/proxy-spool
 docker compose build --no-cache
 docker compose up -d
 docker compose ps
 ```
 
 The Compose file pins the service to `linux/amd64`, and the runtime image is
-`ubuntu:24.04`.
+`ubuntu:24.04`. The container runs as UID/GID `10001`, so the bind-mounted
+spool directory must be writable by `10001:10001`.
 
 ## Harbor Configuration
 
